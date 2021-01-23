@@ -1,0 +1,388 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Fri Oct 16 11:08:58 2020
+
+@author: rajde
+"""
+
+# Import libraries
+import pandas as pd
+import numpy as np
+from scipy import signal
+import peakutils
+from scipy.signal import find_peaks, peak_widths, peak_prominences
+import matplotlib.pyplot as plt
+import biosppy
+from hrvanalysis import get_time_domain_features, get_frequency_domain_features
+from scipy import stats
+
+# Function Definations
+
+def calculate_sample_rate(dataframe_signal):
+    time=dataframe_signal['TIME']
+    time=time*60
+    d_time=time.diff().mean()
+    sample_frequency=int(1/d_time)
+    return int(sample_frequency)
+def butterworth(dataframe,n,wn):
+    B, A = signal.butter(n, wn, output='ba')
+    dataframe = signal.filtfilt(B,A, dataframe)
+    return dataframe
+def normalize(dataframe):
+    minimum=np.min(dataframe)
+    maximum=np.max(dataframe)
+    dataframe=(dataframe-minimum)/(maximum-minimum)
+    return dataframe
+def find_range(array_data):
+    print(len(array_data))
+    if(len(array_data)>0):
+        range_data=abs(np.max(array_data)-np.min(array_data))
+    if(len(array_data)==0):
+        range_data=0
+    return range_data
+def data_reduce(filename):
+    temp=pd.read_csv(filename,skiprows=[1])
+    temp.columns=['TIME','ECG','EMG','F_GSR','H_GSR','HR','MARKER','RESP']
+    temp=temp.drop(['EMG','MARKER'],axis=1)
+    return temp
+def get_slope_intercept(resp):
+    if(len(resp)==0):
+        return 0,0,0,0
+    else:
+        return stats.theilslopes(resp, np.arange(len(resp)), 0.90) 
+def data_cleanse(filename,frequency_fgsr,frequency_hgsr,frequency_ecg,frequency_resp):
+    # Reduce Dataset
+    dataframe=data_reduce(filename)
+    # Calculate Sample Rate
+    sample_rate=calculate_sample_rate(dataframe)
+    # Extract Individually
+    f_gsr=dataframe['F_GSR']
+    h_gsr=dataframe['H_GSR']
+    ecg=dataframe['ECG']
+    resp=dataframe['RESP']
+    # Extract time and HR to convert to array
+    time_minutes=dataframe['TIME']
+    time_minutes=np.asarray(time_minutes)
+    hr=dataframe['HR']
+    hr=np.asarray(hr)
+    # Normalize Individually
+    f_gsr=normalize(f_gsr)
+    h_gsr=normalize(h_gsr)
+    ecg=normalize(ecg)
+    resp=normalize(resp)
+    # Low Pass Filtering
+    cuttoff_fgsr=(2*frequency_fgsr)/sample_rate
+    cuttoff_hgsr=(2*frequency_hgsr)/sample_rate
+    cuttoff_ecg=(2*frequency_ecg)/sample_rate
+    cuttoff_resp=(2*frequency_resp)/sample_rate
+    variable_sample_fgsr=butterworth(f_gsr,5,cuttoff_fgsr)
+    variable_sample_hgsr=butterworth(h_gsr,5,cuttoff_hgsr)    
+    variable_sample_ecg=butterworth(ecg,5,cuttoff_ecg)
+    variable_sample_resp=butterworth(resp,5,cuttoff_resp) 
+    # Merge and return
+    clean_signal_frame=pd.DataFrame({
+        'TIME':time_minutes,
+        'HR':hr,
+        'F_GSR':variable_sample_fgsr,
+        'H_GSR':variable_sample_hgsr,
+        'ECG':variable_sample_ecg,
+        'RESP':variable_sample_resp})
+    return clean_signal_frame
+
+def segment_gsr_extraction(segment,key,sample_rate,scl,label):
+    segment_signal=segment[key]
+    segment_signal=segment_signal-scl
+    segment_signal_deriv=np.gradient(segment_signal)
+    # statistical
+    mean_signal=[]
+    var_signal=[]
+    # peaks
+    no_peaks=[]
+    sum_amp_peaks=[]
+    sum_response_duration=[]
+    # range_response_duration=[]
+    mean_peak_prominence=[]
+    var_peak_prominence=[]
+    #Extract statistical feature
+    start=0
+    end=int(100*(sample_rate))
+    overlap=int(100*(sample_rate)/2)
+    while(end<=len(segment_signal)):
+        mean_signal.append(np.mean(segment_signal[start:end]))
+        var_signal.append(np.var(segment_signal[start:end]))
+        start=start+overlap
+        end=end+overlap
+    # Extract characteristic feature
+    start=0
+    end=int(100*(sample_rate))
+    overlap=int(100*(sample_rate)/2)
+    while(end<=len(segment_signal)):
+        peak_indices, _ = find_peaks(segment_signal_deriv[start:end],0.0001)
+        gsr_amp=segment_signal_deriv[peak_indices]
+        no_peaks.append(len(gsr_amp))
+        sum_amp_peaks.append(sum(gsr_amp))
+        peak_widths=signal.peak_widths(segment_signal_deriv[start:end],peak_indices)
+        peak_prominance=signal.peak_prominences(segment_signal_deriv[start:end],peak_indices)
+        p_widths=peak_widths[0]
+        p_prom=peak_prominance[0]
+        sum_response_duration.append(sum(p_widths)*sample_rate)
+        # range_response_duration.append(find_range(gsr_peak_widths)*sample_rate)
+        mean_peak_prominence.append(np.mean(p_prom))
+        var_peak_prominence.append(np.var(p_prom))
+        start=start+overlap
+        end=end+overlap
+    if(key=='F_GSR'):
+        df_feature=pd.DataFrame({
+            'MEAN_FGSR':mean_signal,
+            'VAR_FGSR':var_signal,
+            '#FPEAKS':no_peaks,
+            'SUM_PEAKS_FGSR':sum_amp_peaks,
+            'SUM_RESPONSE_FGSR':sum_response_duration,
+            # 'RANGE_RESPONSE_GSR':range_response_duration,
+            'MEAN_PROM_FGSR':mean_peak_prominence,
+            'VAR_PROM_FGSR':var_peak_prominence})
+        df_feature['Label']=label
+        return df_feature
+    elif(key=='H_GSR'):
+        df_feature=pd.DataFrame({
+            'MEAN_HGSR':mean_signal,
+            'VAR_HGSR':var_signal,
+            '#HPEAKS':no_peaks,
+            'SUM_PEAKS_HGSR':sum_amp_peaks,
+            'SUM_RESPONSE_HGSR':sum_response_duration,
+            # 'RANGE_RESPONSE_GSR':range_response_duration,
+            'MEAN_PROM_HGSR':mean_peak_prominence,
+            'VAR_PROM_HGSR':var_peak_prominence})
+        df_feature['Label']=label
+        return df_feature
+def segment_ecg_extraction(segment,key,sample_rate,label):
+    segment_signal=segment[key]
+    # Time Domain Features
+    nni_ecg=[]
+    sdnn_ecg=[]
+    sdsd_ecg=[]
+    nni_ecg_50=[]
+    pnni_ecg_50=[]
+    nni_ecg_20=[]
+    pnni_ecg_20=[]
+    rmssd_ecg=[]
+    range_nni_ecg=[]
+    cvsd_ecg=[]
+    cvnni_ecg=[]
+    mean_hr_ecg=[]
+    max_hr_ecg=[]
+    min_hr_ecg=[]
+    std_hr_ecg=[]
+    # Frequency Domain Features
+    lf_ecg=[]
+    hf_ecg=[]
+    vlf_ecg=[]
+    lfhf_ecg=[]
+    lfnu_ecg=[]
+    hfnu_ecg=[]
+    power_ecg=[]
+    # Extract time domain features
+    start=0
+    end=int(100*(sample_rate))
+    overlap=int(100*(sample_rate)/2)
+    while(end<=len(segment_signal)):
+        peak_indices, _ = find_peaks(segment_signal,height=0.65,distance=sample_rate*0.55,width=sample_rate*0.01) 
+        peak_indices=(peak_indices/sample_rate)
+        print(len(peak_indices))
+        time_domain_features = get_time_domain_features(peak_indices)
+        nni_ecg.append(time_domain_features['mean_nni'])
+        sdnn_ecg.append(time_domain_features['sdnn'])
+        sdsd_ecg.append(time_domain_features['sdsd'])
+        nni_ecg_50.append(time_domain_features['nni_50'])
+        pnni_ecg_50.append(time_domain_features['pnni_20'])
+        nni_ecg_20.append(time_domain_features['nni_20'])
+        pnni_ecg_20.append(time_domain_features['pnni_20'])
+        rmssd_ecg.append(time_domain_features['rmssd'])
+        range_nni_ecg.append(time_domain_features['range_nni'])
+        cvsd_ecg.append(time_domain_features['cvsd'])
+        cvnni_ecg.append(time_domain_features['cvnni'])
+        mean_hr_ecg.append(time_domain_features['mean_hr'])
+        max_hr_ecg.append(time_domain_features['max_hr'])
+        min_hr_ecg.append(time_domain_features['min_hr'])
+        std_hr_ecg.append(time_domain_features['std_hr'])
+        frequency_domain_features=get_frequency_domain_features(peak_indices)
+        lf_ecg.append(frequency_domain_features['lf'])
+        hf_ecg.append(frequency_domain_features['hf'])
+        vlf_ecg.append(frequency_domain_features['vlf'])
+        lfhf_ecg.append(frequency_domain_features['lf_hf_ratio'])
+        lfnu_ecg.append(frequency_domain_features['lfnu'])
+        hfnu_ecg.append(frequency_domain_features['hfnu'])
+        power_ecg.append(frequency_domain_features['total_power'])
+        start=start+overlap
+        end=end+overlap
+    df_feature=pd.DataFrame({
+        'NNI_ECG':nni_ecg,
+        'SDNN_ECG':sdnn_ecg,
+        'SDSD_ECG':sdsd_ecg,
+        'NNI_ECG_50':nni_ecg_50,
+        'PNNI_ECG_50':pnni_ecg_50,
+        'NNI_ECG_20':nni_ecg_20,
+        'PNNI_ECG_20':pnni_ecg_20,
+        'RMSSD_ECG':rmssd_ecg,
+        'RANGE_NNI_ECG':range_nni_ecg,
+        'CVSD_ECG':cvsd_ecg,
+        'CVNNI_ECG':cvnni_ecg,
+        'MEAN_HR_ECG':mean_hr_ecg,
+        'MAX_HR_ECG':max_hr_ecg,
+        'MIN_HR_ECG':min_hr_ecg,
+        'STD_HR_ECG':std_hr_ecg,
+        'LF_ECG':lf_ecg,
+        'HF_ECG':hf_ecg,
+        'VLF_ECG':vlf_ecg,
+        'LFHF_ECG':lfhf_ecg,
+        'LFNU_ECG':lfnu_ecg,
+        'HFNU_ECG':hfnu_ecg,
+        'POWER_ECG':power_ecg})
+    df_feature['Label']=label
+    return df_feature        
+
+def segment_resp_extraction(segment,key,sample_rate,label):
+    segment_signal=segment[key]
+    # feature variable defination
+    mean_resp=[]
+    var_resp=[]
+    p1_resp=[]
+    p2_resp=[]
+    p3_resp=[]
+    p4_resp=[]
+    # resp_slope=[]
+    # resp_intercept=[]
+    # Extract Features
+    start=0
+    end=int(100*(sample_rate))
+    overlap=int(100*(sample_rate)/2)
+    while(end<=len(segment_signal)):
+        mean_resp.append(np.mean(segment_signal[start:end]))
+        var_resp.append(np.var(segment_signal[start:end]))
+        freq,psd=signal.periodogram(segment_signal[start:end], 31)
+        p1_resp.append(biosppy.signals.tools.band_power(freqs=freq,power=psd,frequency=[0,0.1],decibel=True)['avg_power'])
+        p2_resp.append(biosppy.signals.tools.band_power(freqs=freq,power=psd,frequency=[0.1,0.2],decibel=True)['avg_power'])
+        p3_resp.append(biosppy.signals.tools.band_power(freqs=freq,power=psd,frequency=[0.2,0.3],decibel=True)['avg_power'])
+        p4_resp.append(biosppy.signals.tools.band_power(freqs=freq,power=psd,frequency=[0.3,0.4],decibel=True)['avg_power'])
+        start=start+overlap
+        end=end+overlap
+    df_feature=pd.DataFrame({
+        'MEAN_RESP':mean_resp,
+        'VAR_RESP':var_resp,
+        'P1_RESP':p1_resp,
+        'P2_RESP':p2_resp,
+        'P3':p3_resp,
+        'P4':p4_resp})
+        # 'RESP_SLOPE':resp_slope,
+        # 'RESP_INTERCEPT':resp_intercept})
+    df_feature['Label']=label
+    return df_feature    
+
+# Variable and DS initialization
+rest=[15.13, 15.05, 15.04, 15, 15.66, 15.04, 15.02, 15.01, 15, 15.01]
+city1=[16, 14.49, 16.23, 12.31, 19.21, 15.3, 15.81, 13.41, 12.54, 16.12]
+highway1=[7.74, 7.32, 10.96, 7.23, 8.47, 8.66, 7.43, 7.56, 7.24, 7.14]
+city2=[6.06, 6.53, 9.83, 9.51, 5.2, 5.27, 7.15, 6.5, 5.99, 5.12]
+highway2=[7.56, 7.64, 7.64, 7.64, 7.06, 7.04, 6.96, 8.06, 6.82, 6.81]
+city3=[14.96, 12.29, 10.15, 13.43, 13.21, 12.06, 11.72, 11.68, 12.12, 13.91]
+
+def feature_extraction(dataframe,ID):
+    #Segment into 6 sections and label
+    sample_rate=calculate_sample_rate(dataframe)
+    rest_end_time=rest[ID]
+    city1_end_time=rest_end_time+city1[ID]
+    highway1_end_time=city1_end_time+highway1[ID]
+    city2_end_time=highway1_end_time+city2[ID]
+    highway2_end_time=city2_end_time+highway2[ID]
+    city3_end_time=highway2_end_time+city3[ID]
+    #Rest segment
+    rest_segment=dataframe[int(sample_rate*(rest_end_time-5)*60):int(sample_rate*(rest_end_time)*60)]
+    rest_segment['Label']=0
+    # City1 segment
+    city1_segment=dataframe[int(sample_rate*(city1_end_time-5)*60):int(sample_rate*(city1_end_time)*60)]
+    city1_segment['Label']=2
+    # Highway1 segment
+    highway1_segment=dataframe[int(sample_rate*(highway1_end_time-5)*60):int(sample_rate*(highway1_end_time)*60)]
+    highway1_segment['Label']=1
+    # City2 segment
+    city2_segment=dataframe[int(sample_rate*(city2_end_time-5)*60):int(sample_rate*(city2_end_time)*60)]
+    city2_segment['Label']=2
+    # Highway2 Segment
+    highway2_segment=dataframe[int(sample_rate*(highway2_end_time-5)*60):int(sample_rate*(highway2_end_time)*60)]
+    highway2_segment['Label']=1
+    # City3 segment
+    city3_segment=dataframe[int(sample_rate*(city3_end_time-5)*60):int(sample_rate*(city3_end_time)*60)]
+    city3_segment['Label']=2
+    # Baseline Conditioning
+    # feet
+    fgsr_baseline=rest_segment['F_GSR']
+    min_scl=np.min(fgsr_baseline)
+    max_scl=np.max(fgsr_baseline)
+    scl_mean=np.mean(fgsr_baseline)
+    fscl=(scl_mean-min_scl)/(max_scl-min_scl)
+    # hand
+    hgsr_baseline=rest_segment['H_GSR']
+    min_scl=np.min(hgsr_baseline)
+    max_scl=np.max(hgsr_baseline)
+    scl_mean=np.mean(hgsr_baseline)
+    hscl=(scl_mean-min_scl)/(max_scl-min_scl)
+    # Extract F_GSR features for all segments and concatanate
+    rest_fgsr_feature=segment_gsr_extraction(rest_segment,'F_GSR',sample_rate,fscl,0)
+    city1_fgsr_feature=segment_gsr_extraction(city1_segment,'F_GSR',sample_rate,fscl,2)
+    highway1_fgsr_feature=segment_gsr_extraction(highway1_segment,'F_GSR',sample_rate,fscl,1)
+    city2_fgsr_feature=segment_gsr_extraction(city2_segment,'F_GSR',sample_rate,fscl,2)
+    highway2_fgsr_feature=segment_gsr_extraction(highway2_segment,'F_GSR',sample_rate,fscl,1)
+    city3_fgsr_feature=segment_gsr_extraction(city3_segment,'F_GSR',sample_rate,fscl,2)
+    f_gsr_feature=pd.concat([rest_fgsr_feature,city1_fgsr_feature,highway1_fgsr_feature,
+                             city2_fgsr_feature,highway2_fgsr_feature,city3_fgsr_feature],axis=0)
+    print('foot GSR done')
+    # Extract H_GSR features for all segments and concatenate
+    rest_hgsr_feature=segment_gsr_extraction(rest_segment,'H_GSR',sample_rate,hscl,0)
+    city1_hgsr_feature=segment_gsr_extraction(city1_segment,'H_GSR',sample_rate,hscl,2)
+    highway1_hgsr_feature=segment_gsr_extraction(highway1_segment,'H_GSR',sample_rate,hscl,1)
+    city2_hgsr_feature=segment_gsr_extraction(city2_segment,'H_GSR',sample_rate,hscl,2)
+    highway2_hgsr_feature=segment_gsr_extraction(highway2_segment,'H_GSR',sample_rate,hscl,1)
+    city3_hgsr_feature=segment_gsr_extraction(city3_segment,'H_GSR',sample_rate,hscl,2)
+    h_gsr_feature=pd.concat([rest_hgsr_feature,city1_hgsr_feature,highway1_hgsr_feature,
+                             city2_hgsr_feature,highway2_hgsr_feature,city3_hgsr_feature],axis=0)
+    print('hand GSR done')
+    # Extract ECG Features for all segments and concatenate
+    rest_ecg_feature=segment_ecg_extraction(rest_segment,'ECG',sample_rate,0)
+    city1_ecg_feature=segment_ecg_extraction(city1_segment,'ECG',sample_rate,2)
+    highway1_ecg_feature=segment_ecg_extraction(highway1_segment,'ECG',sample_rate,1)   
+    city2_ecg_feature=segment_ecg_extraction(city2_segment,'ECG',sample_rate,2)
+    highway2_ecg_feature=segment_ecg_extraction(highway2_segment,'ECG',sample_rate,1)
+    city3_ecg_feature=segment_ecg_extraction(city3_segment,'ECG',sample_rate,2)
+    ecg_feature=pd.concat([rest_ecg_feature,city1_ecg_feature,highway1_ecg_feature,
+                             city2_ecg_feature,highway2_ecg_feature,city3_ecg_feature],axis=0)
+    print('ECG done')
+    # Extract RESP Features for all segments and concatenate
+    rest_resp_feature=segment_resp_extraction(rest_segment,'RESP',sample_rate,0)
+    city1_resp_feature=segment_resp_extraction(city1_segment,'RESP',sample_rate,2)
+    highway1_resp_feature=segment_resp_extraction(highway1_segment,'RESP',sample_rate,1)   
+    city2_resp_feature=segment_resp_extraction(city2_segment,'RESP',sample_rate,2)
+    highway2_resp_feature=segment_resp_extraction(highway2_segment,'RESP',sample_rate,1)
+    city3_resp_feature=segment_resp_extraction(city3_segment,'RESP',sample_rate,2)
+    resp_feature=pd.concat([rest_resp_feature,city1_resp_feature,highway1_resp_feature,
+                             city2_resp_feature,highway2_resp_feature,city3_resp_feature],axis=0)
+    print('RESP done')
+    # Concat final features:
+    labels=f_gsr_feature['Label']
+    f_gsr_feature=f_gsr_feature.drop(['Label'],axis=1)
+    h_gsr_feature=h_gsr_feature.drop(['Label'],axis=1)
+    ecg_feature=ecg_feature.drop(['Label'],axis=1)
+    resp_feature=resp_feature.drop(['Label'],axis=1)
+    final_feature=pd.concat([f_gsr_feature,f_gsr_feature,ecg_feature,resp_feature],axis=1)
+    final_feature['Label']=labels
+    return final_feature
+    
+drive_files=['drive05.csv','drive06.csv','drive07.csv','drive10.csv','drive11.csv','drive12.csv','drive15.csv']
+id_numbers=[0,1,2,5,6,7,8]
+
+for i in range(0,len(drive_files)):
+    filename=drive_files[i]
+    ID=id_numbers[i]
+    temp=feature_extraction(data_cleanse(filename,1,1,40,10),ID)
+    temp.to_csv('drive_'+str(ID)+'feature.csv')
+    print('Number', ID, 'done')
+
